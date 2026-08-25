@@ -1,0 +1,29 @@
+# Lenguaje base: Python 3.10+
+
+# Clustering (Slotting)
+scikit-learn>=1.4
+scikit-learn-extra>=0.3.0   # K-Medoids
+
+# Algoritmo Genético
+pygad>=3.3                  # prototipo rápido
+deap>=1.4                   # version con mas control, opcional/fase 2
+
+# DRL (Routing)
+torch>=2.2
+stable-baselines3>=2.3
+gymnasium>=0.29
+
+# API / Microservicios
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pydantic>=2.6
+
+# Datos y análisis
+pandas>=2.2
+numpy>=1.26
+matplotlib>=3.8
+seaborn>=0.13
+
+# Utilidades
+python-dotenv>=1.0
+pytest>=8.0

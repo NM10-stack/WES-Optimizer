@@ -1,0 +1,29 @@
+# Entornos virtuales
+venv/
+env/
+__pycache__/
+*.pyc
+
+# Datos sensibles de STG - NUNCA subir a git
+data/raw/*
+!data/raw/.gitkeep
+
+# Modelos entrenados (pesan mucho, no van al repo)
+*.pt
+*.pth
+*.zip
+models/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Entorno
+.env
+
+# SO
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
