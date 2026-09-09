@@ -38,10 +38,12 @@ def generate_products(n_products: int) -> pd.DataFrame:
     })
 
 
-def generate_orders(n_orders: int, products: pd.DataFrame) -> pd.DataFrame:
+def generate_orders(n_orders: int, products: pd.DataFrame, noise_ratio: float = 0.35) -> pd.DataFrame:
     """
-    Historial de pedidos. Se simulan 'clusters de afinidad' ocultos para que
-    el modelo de clustering tenga una senal real que recuperar, no puro ruido.
+    Genera pedidos con una mezcla de productos del mismo cluster de
+    afinidad (mayoria) y productos de otros clusters elegidos al azar
+    (noise_ratio), simulando que en la practica los pedidos rara vez son
+    100% homogeneos en afinidad de compra.
     """
     n_products = len(products)
     n_hidden_clusters = 8
@@ -53,10 +55,16 @@ def generate_orders(n_orders: int, products: pd.DataFrame) -> pd.DataFrame:
         base_cluster = np.random.randint(0, n_hidden_clusters)
         candidate_idxs = np.where(cluster_of_sku == base_cluster)[0]
 
-        if len(candidate_idxs) < n_items:
-            chosen = np.random.choice(n_products, size=n_items, replace=False)
-        else:
-            chosen = np.random.choice(candidate_idxs, size=n_items, replace=False)
+        n_noise_items = int(round(n_items * noise_ratio))
+        n_affinity_items = n_items - n_noise_items
+
+        affinity_pool = candidate_idxs if len(candidate_idxs) >= n_affinity_items else np.arange(n_products)
+        affinity_chosen = np.random.choice(affinity_pool, size=n_affinity_items, replace=False)
+
+        remaining_pool = np.setdiff1d(np.arange(n_products), affinity_chosen)
+        noise_chosen = np.random.choice(remaining_pool, size=min(n_noise_items, len(remaining_pool)), replace=False)
+
+        chosen = np.concatenate([affinity_chosen, noise_chosen])
 
         for sku_idx in chosen:
             rows.append({
