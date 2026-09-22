@@ -22,13 +22,21 @@ SLOTS_PER_AISLE = 20
 MIN_AISLES = 10
 
 
-def compute_warehouse_dimensions(n_products: int, slots_per_aisle: int = SLOTS_PER_AISLE) -> tuple[int, int]:
+def compute_warehouse_dimensions(n_products: int, min_aisles: int = MIN_AISLES) -> tuple[int, int]:
     """
-    Calcula el numero de pasillos necesarios para alojar todos los
-    productos, dado un numero fijo de slots por pasillo.
+    Calcula un layout de almacen razonablemente cuadrado (pasillos x
+    posiciones por pasillo similares entre si) con capacidad suficiente
+    para todos los productos. Se evita fijar un numero de posiciones por
+    pasillo constante (ej. 20), ya que para catalogos grandes esto
+    generaria una cantidad de pasillos poco realista (cientos de
+    pasillos muy angostos). En su lugar, ambos ejes escalan juntos segun
+    la raiz cuadrada del numero de productos, aproximando un almacen de
+    forma mas realista.
     """
-    n_aisles = int(np.ceil(n_products / slots_per_aisle))
-    return max(n_aisles, MIN_AISLES), slots_per_aisle
+    side = int(np.ceil(np.sqrt(n_products)))
+    n_aisles = max(side, min_aisles)
+    slots_per_aisle = max(side, min_aisles)
+    return n_aisles, slots_per_aisle
 
 
 def build_all_positions(n_aisles: int, slots_per_aisle: int) -> list[tuple[int, int]]:

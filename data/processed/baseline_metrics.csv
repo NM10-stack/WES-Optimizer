@@ -1,2 +1,2 @@
 silhouette_score,n_clusters,n_aisles,slots_per_aisle,distancia_inicial,distancia_heuristica_popularidad,distancia_optimizada,mejora_porcentual,mejora_vs_heuristica_pct
-0.0051314369350097125,4,198,20,36734272.0,17565009.0,22659961.0,38.31384217985864,-29.00625897772099
+0.0051314369350097125,4,63,63,21397615.0,14023238.0,15168615.0,29.110720984558323,-8.167707058811951
