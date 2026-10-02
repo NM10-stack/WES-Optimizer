@@ -1,11 +1,11 @@
 """
-Pipeline completo de optimizacion de Slotting.
+Pipeline completo de optimizacion de Slotting (version fusionada).
 
-Integra el modulo de clustering (afinidad de compra -> grupos K-Medoids)
-con el modulo de Algoritmo Genetico (asignacion de posiciones fisicas
-individuales por producto, agrupadas segun cluster), y calcula la
-comparacion entre tres situaciones: ubicacion aleatoria, ubicacion por
-heuristica de popularidad, y ubicacion optimizada por el modelo.
+Integra clustering por afinidad de compra (K-Medoids sobre indice de
+Jaccard) con un Algoritmo Genetico que asigna posiciones 3D individuales
+a cada producto, respetando la capacidad estructural de cada nivel de
+estanteria. Calcula la comparacion entre tres situaciones: ubicacion
+aleatoria, heuristica de popularidad, y ubicacion optimizada.
 """
 
 import pandas as pd
@@ -13,70 +13,67 @@ import pandas as pd
 from clustering import build_affinity_matrix, affinity_to_distance, cluster_products, silhouette_by_k
 from genetic_algorithm import (
     build_order_groups,
-    baseline_distance,
-    random_baseline_distance,
-    popularity_baseline_distance,
-    total_distance_for_positions,
-    run_genetic_algorithm,
-    assign_individual_positions,
     compute_warehouse_dimensions,
     build_all_positions,
+    run_genetic_algorithm,
+    random_baseline_distance,
+    popularity_baseline_distance,
+    evaluar_ruta_real,
 )
 
 
 def run_slotting_pipeline(
     products: pd.DataFrame,
     orders: pd.DataFrame,
+    capacidades_por_nivel: dict[int, float] | None = None,
     k_range: range = range(4, 13),
+    num_generations: int = 40,
+    poblacion: int = 20,
 ) -> dict:
     skus = products["sku"].tolist()
 
-    n_aisles, slots_per_aisle = compute_warehouse_dimensions(len(products))
-    all_positions = build_all_positions(n_aisles, slots_per_aisle)
+    n_aisles, slots_per_aisle, niveles = compute_warehouse_dimensions(len(products))
+    all_positions = build_all_positions(n_aisles, slots_per_aisle, niveles)
 
     affinity = build_affinity_matrix(orders, skus)
     distance_matrix = affinity_to_distance(affinity)
-
     scores = silhouette_by_k(distance_matrix, k_range)
     best_k = max(scores, key=scores.get)
-
-    labels = cluster_products(distance_matrix, best_k)
     products = products.copy()
-    products["cluster"] = labels
+    products["cluster"] = cluster_products(distance_matrix, best_k)
 
     order_groups = build_order_groups(orders)
 
     initial_distance = random_baseline_distance(products, order_groups, all_positions)
     popularity_distance = popularity_baseline_distance(products, orders, order_groups, all_positions)
 
-    best_positions, fitness_history = run_genetic_algorithm(
-        products, order_groups, best_k, all_positions, n_aisles, slots_per_aisle
+    mejor_asignacion, historial = run_genetic_algorithm(
+        products, order_groups, all_positions, capacidades_por_nivel, num_generations, poblacion
     )
 
-    cluster_anchor_positions = {i: tuple(best_positions[i]) for i in range(best_k)}
-    sku_to_new_position = assign_individual_positions(products, cluster_anchor_positions, all_positions)
+    products["new_aisle"] = products["sku"].map(lambda s: mejor_asignacion[s][0])
+    products["new_slot"] = products["sku"].map(lambda s: mejor_asignacion[s][1])
+    products["new_nivel"] = products["sku"].map(lambda s: mejor_asignacion[s][2])
 
-    products["new_aisle"] = products["sku"].map(lambda s: sku_to_new_position[s][0])
-    products["new_slot"] = products["sku"].map(lambda s: sku_to_new_position[s][1])
+    optimized_distance = evaluar_ruta_real(order_groups, mejor_asignacion)
 
-    optimized_distance = total_distance_for_positions(order_groups, sku_to_new_position)
-
-    improvement_pct = (initial_distance - optimized_distance) / initial_distance * 100
-    improvement_vs_popularity_pct = (popularity_distance - optimized_distance) / popularity_distance * 100
+    mejora_vs_aleatorio = (initial_distance - optimized_distance) / initial_distance * 100
+    mejora_vs_popularidad = (popularity_distance - optimized_distance) / popularity_distance * 100
 
     metrics = {
         "silhouette_score": scores[best_k],
         "n_clusters": best_k,
         "n_aisles": n_aisles,
         "slots_per_aisle": slots_per_aisle,
-        "distancia_inicial": initial_distance,
+        "niveles_altura": niveles,
+        "distancia_inicial_aleatoria": initial_distance,
         "distancia_heuristica_popularidad": popularity_distance,
         "distancia_optimizada": optimized_distance,
-        "mejora_porcentual": improvement_pct,
-        "mejora_vs_heuristica_pct": improvement_vs_popularity_pct,
+        "mejora_vs_aleatorio_pct": mejora_vs_aleatorio,
+        "mejora_vs_heuristica_pct": mejora_vs_popularidad,
     }
 
-    return {"products": products, "metrics": metrics, "convergence": fitness_history}
+    return {"products": products, "metrics": metrics, "convergence": historial}
 
 
 if __name__ == "__main__":

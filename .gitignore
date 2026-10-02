@@ -7,6 +7,9 @@ __pycache__/
 # Datos sensibles de STG - NUNCA subir a git
 data/raw/*
 !data/raw/.gitkeep
+!data/raw/load_online_retail.py
+!data/raw/products_real.csv
+!data/raw/orders_real_full.csv
 
 # Modelos entrenados (pesan mucho, no van al repo)
 *.pt

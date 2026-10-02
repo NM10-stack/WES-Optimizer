@@ -1,52 +1,59 @@
 """
 Modulo de optimizacion de posiciones fisicas mediante Algoritmo Genetico.
 
-Toma los clusters de afinidad generados por clustering.py y determina la
-mejor posicion (pasillo, slot) para cada cluster. A cada producto se le
-asigna una posicion individual y distinta, ubicada dentro del bloque de
-posiciones mas cercano al ancla de su cluster: esto evita que productos
-de un mismo cluster compartan coordenada exacta (fisicamente imposible
-en un almacen real) y evita que el resultado se vea artificialmente
-perfecto solo por compartir posicion.
+Cada producto recibe una posicion tridimensional individual y distinta
+(pasillo, posicion en el pasillo, nivel de altura), respetando la
+capacidad estructural de cada nivel de estanteria (restricciones_
+ergonomicas.py). El cromosoma es una permutacion de posiciones
+asignadas a productos, y el fitness se calcula simulando la ruta real
+de recoleccion (el operario siempre se dirige al producto no recogido
+mas cercano), partiendo y regresando a la puerta de despacho.
 
-El tamano del almacen (numero de pasillos) se calcula dinamicamente segun
-la cantidad de productos a ubicar, para que el layout siempre tenga
-capacidad suficiente sin importar el tamano del dataset utilizado.
+El tamano del almacen (pasillos x posiciones por pasillo x niveles) se
+calcula dinamicamente segun la cantidad de productos a ubicar.
 """
 
 import numpy as np
 import pandas as pd
-import pygad
 
-SLOTS_PER_AISLE = 20
-MIN_AISLES = 10
+from restricciones_ergonomicas import producto_cabe_estructuralmente
+
+NIVELES_ALTURA = 4
+FACTOR_COSTO_ALTURA = 2.0
+PUERTA_DESPACHO = (0, 0, 0)
 
 
-def compute_warehouse_dimensions(n_products: int, min_aisles: int = MIN_AISLES) -> tuple[int, int]:
+def compute_warehouse_dimensions(n_products: int, niveles: int = NIVELES_ALTURA, min_lado: int = 10) -> tuple[int, int, int]:
     """
-    Calcula un layout de almacen razonablemente cuadrado (pasillos x
-    posiciones por pasillo similares entre si) con capacidad suficiente
-    para todos los productos. Se evita fijar un numero de posiciones por
-    pasillo constante (ej. 20), ya que para catalogos grandes esto
-    generaria una cantidad de pasillos poco realista (cientos de
-    pasillos muy angostos). En su lugar, ambos ejes escalan juntos segun
-    la raiz cuadrada del numero de productos, aproximando un almacen de
-    forma mas realista.
+    Calcula un layout de almacen de forma razonablemente cuadrada en el
+    plano (pasillo x posicion), dado un numero fijo de niveles de
+    altura, con capacidad suficiente para todos los productos.
     """
-    side = int(np.ceil(np.sqrt(n_products)))
-    n_aisles = max(side, min_aisles)
-    slots_per_aisle = max(side, min_aisles)
-    return n_aisles, slots_per_aisle
+    posiciones_por_nivel_necesarias = int(np.ceil(n_products / niveles))
+    lado = max(int(np.ceil(np.sqrt(posiciones_por_nivel_necesarias))), min_lado)
+    return lado, lado, niveles
 
 
-def build_all_positions(n_aisles: int, slots_per_aisle: int) -> list[tuple[int, int]]:
-    """Genera todas las posiciones (pasillo, slot) posibles del almacen."""
-    return [(a, s) for a in range(1, n_aisles + 1) for s in range(1, slots_per_aisle + 1)]
+def build_all_positions(n_aisles: int, slots_per_aisle: int, niveles: int) -> list[tuple[int, int, int]]:
+    """Genera todas las posiciones (pasillo, slot, nivel) posibles del almacen."""
+    return [
+        (a, s, n)
+        for a in range(1, n_aisles + 1)
+        for s in range(1, slots_per_aisle + 1)
+        for n in range(niveles)
+    ]
 
 
-def manhattan_distance(pos_a: tuple[float, float], pos_b: tuple[float, float]) -> float:
-    """Distancia Manhattan entre dos posiciones (pasillo, slot)."""
-    return abs(pos_a[0] - pos_b[0]) + abs(pos_a[1] - pos_b[1])
+def manhattan_distance_3d(pos_a: tuple[int, int, int], pos_b: tuple[int, int, int]) -> float:
+    """
+    Distancia Manhattan en 3D, penalizando el desplazamiento vertical
+    (cambio de nivel) con un factor mayor que el desplazamiento
+    horizontal, ya que subir/bajar de nivel toma mas tiempo y esfuerzo
+    que desplazarse en el plano del almacen.
+    """
+    dist_horizontal = abs(pos_a[0] - pos_b[0]) + abs(pos_a[1] - pos_b[1])
+    dist_vertical = abs(pos_a[2] - pos_b[2]) * FACTOR_COSTO_ALTURA
+    return dist_horizontal + dist_vertical
 
 
 def build_order_groups(orders: pd.DataFrame) -> list[list[str]]:
@@ -54,186 +61,267 @@ def build_order_groups(orders: pd.DataFrame) -> list[list[str]]:
     return orders.groupby("order_id")["sku"].apply(list).tolist()
 
 
-def total_distance_for_positions(
-    order_groups: list[list[str]],
-    sku_to_position: dict[str, tuple[float, float]],
-) -> float:
+def evaluar_ruta_real(order_groups: list[list[str]], sku_to_position: dict[str, tuple[int, int, int]]) -> float:
     """
-    Calcula la distancia total recorrida para completar todos los pedidos,
-    dado un mapeo sku -> posicion. Suma la distancia entre productos
-    consecutivos segun el orden en que aparecen en cada pedido.
+    Simula la ruta de recoleccion de cada pedido: el operario parte de
+    la puerta de despacho y, en cada paso, se dirige al producto no
+    recogido mas cercano a su posicion actual, hasta completar el
+    pedido y retornar a la puerta. Esta aproximacion (vecino mas
+    cercano) es mas realista que sumar distancias en un orden arbitrario
+    de aparicion en el historial de pedidos.
     """
-    total = 0.0
+    costo_total = 0.0
+
     for skus in order_groups:
-        positions = [sku_to_position[sku] for sku in skus if sku in sku_to_position]
-        for i in range(len(positions) - 1):
-            total += manhattan_distance(positions[i], positions[i + 1])
-    return total
+        posiciones_pendientes = [sku_to_position[s] for s in skus if s in sku_to_position]
+        if not posiciones_pendientes:
+            continue
+
+        posicion_actual = PUERTA_DESPACHO
+        while posiciones_pendientes:
+            distancias = [manhattan_distance_3d(posicion_actual, p) for p in posiciones_pendientes]
+            idx_mas_cercano = int(np.argmin(distancias))
+            costo_total += distancias[idx_mas_cercano]
+            posicion_actual = posiciones_pendientes.pop(idx_mas_cercano)
+
+        costo_total += manhattan_distance_3d(posicion_actual, PUERTA_DESPACHO)
+
+    return costo_total
 
 
-def baseline_distance(products: pd.DataFrame, order_groups: list[list[str]]) -> float:
-    """Distancia total usando las ubicaciones actuales (situacion aleatoria)."""
-    sku_to_position = {
-        row["sku"]: (row["aisle"], row["slot"])
-        for _, row in products.iterrows()
-    }
-    return total_distance_for_positions(order_groups, sku_to_position)
-
-def random_baseline_distance(
+def posiciones_validas_por_producto(
     products: pd.DataFrame,
-    order_groups: list[list[str]],
-    all_positions: list[tuple[int, int]],
-    random_state: int = 42,
-) -> float:
+    all_positions: list[tuple[int, int, int]],
+    capacidades_por_nivel: dict[int, float] | None = None,
+) -> dict[str, list[tuple[int, int, int]]]:
     """
-    Distancia total usando una asignacion aleatoria de posiciones, pero
-    calculada sobre el mismo almacen (mismo numero de pasillos/slots) que
-    se usa para las demas comparaciones. Es importante no reutilizar
-    posiciones aleatorias generadas con un tamano de almacen distinto,
-    ya que comparar distancias calculadas en almacenes de tamano
-    diferente no es valido (una bodega mas grande siempre da distancias
-    mayores, independiente de que tan bien organizada este).
+    Para cada producto, filtra las posiciones del almacen que respetan
+    la capacidad estructural del nivel. Si el producto no tiene peso
+    declarado, se asume sin restriccion (todas las posiciones validas).
     """
-    rng = np.random.default_rng(random_state)
-    shuffled_positions = list(all_positions)
-    rng.shuffle(shuffled_positions)
+    tiene_peso = "weight_kg" in products.columns
 
-    skus = products["sku"].tolist()
-    sku_to_position = dict(zip(skus, shuffled_positions))
+    validas = {}
+    for _, row in products.iterrows():
+        sku = row["sku"]
+        peso = row["weight_kg"] if tiene_peso and pd.notna(row.get("weight_kg")) else None
 
-    return total_distance_for_positions(order_groups, sku_to_position)
+        if peso is None:
+            validas[sku] = all_positions
+        else:
+            validas[sku] = [
+                p for p in all_positions
+                if producto_cabe_estructuralmente(peso, p[2], capacidades_por_nivel)
+            ] or all_positions
 
-def popularity_baseline_distance(
+    return validas
+
+
+def asignacion_inicial_aleatoria(
     products: pd.DataFrame,
-    orders: pd.DataFrame,
-    order_groups: list[list[str]],
-    all_positions: list[tuple[int, int]],
-) -> float:
+    all_positions: list[tuple[int, int, int]],
+    posiciones_validas: dict[str, list[tuple[int, int, int]]],
+    rng: np.random.Generator,
+) -> dict[str, tuple[int, int, int]]:
     """
-    Distancia total usando heuristica de slotting por popularidad
-    (analisis ABC): los productos mas pedidos se ubican mas cerca de la
-    entrada del almacen.
+    Genera una asignacion aleatoria valida (respetando restricciones de
+    peso) sin repetir posiciones entre productos. Se procesan primero
+    los productos con menos posiciones validas disponibles (mas
+    restringidos), para reducir la probabilidad de quedarse sin
+    posiciones libres al final.
     """
-    frequency = orders["sku"].value_counts()
-    skus_by_popularity = frequency.index.tolist()
+    productos_ordenados = sorted(products["sku"].tolist(), key=lambda s: len(posiciones_validas[s]))
+    usadas = set()
+    asignacion = {}
 
-    entrance = all_positions[0]
-    positions_sorted = sorted(all_positions, key=lambda p: manhattan_distance(p, entrance))
+    for sku in productos_ordenados:
+        disponibles = [p for p in posiciones_validas[sku] if p not in usadas]
+        if not disponibles:
+            disponibles = [p for p in all_positions if p not in usadas]
+        elegida = disponibles[rng.integers(0, len(disponibles))]
+        asignacion[sku] = elegida
+        usadas.add(elegida)
 
-    sku_to_position = {}
-    for sku, pos in zip(skus_by_popularity, positions_sorted):
-        sku_to_position[sku] = pos
-
-    for sku in products["sku"]:
-        if sku not in sku_to_position:
-            sku_to_position[sku] = positions_sorted[-1]
-
-    return total_distance_for_positions(order_groups, sku_to_position)
+    return asignacion
 
 
-def assign_individual_positions(
-    products: pd.DataFrame,
-    cluster_anchor_positions: dict[int, tuple[float, float]],
-    all_positions: list[tuple[int, int]],
-) -> dict[str, tuple[int, int]]:
+def cruzar(padre1: dict, padre2: dict, skus: list[str], all_positions: list, rng: np.random.Generator) -> dict:
     """
-    Asigna una posicion individual y distinta a cada producto. Los
-    productos del mismo cluster se agrupan en las posiciones disponibles
-    mas cercanas al ancla de ese cluster, sin repetir ninguna posicion
-    entre productos distintos.
+    Cruce de orden: hereda las posiciones de la primera mitad de
+    productos desde el padre1, y completa el resto con las posiciones
+    del padre2 que aun esten libres; si alguna posicion ya fue tomada,
+    se asigna la primera posicion libre disponible.
     """
-    if len(products) > len(all_positions):
-        raise ValueError("No hay suficientes posiciones en el almacen para todos los productos")
+    punto_corte = len(skus) // 2
+    hijo = {}
+    usadas = set()
 
-    used_positions = set()
-    sku_to_position = {}
+    for sku in skus[:punto_corte]:
+        hijo[sku] = padre1[sku]
+        usadas.add(padre1[sku])
 
-    clusters_sorted = products["cluster"].value_counts().index.tolist()
+    for sku in skus[punto_corte:]:
+        pos = padre2[sku]
+        if pos not in usadas:
+            hijo[sku] = pos
+            usadas.add(pos)
+        else:
+            libre = next(p for p in all_positions if p not in usadas)
+            hijo[sku] = libre
+            usadas.add(libre)
 
-    for cluster_id in clusters_sorted:
-        anchor = cluster_anchor_positions[cluster_id]
-        cluster_skus = products.loc[products["cluster"] == cluster_id, "sku"].tolist()
-
-        available = [p for p in all_positions if p not in used_positions]
-        available.sort(key=lambda p: manhattan_distance(p, anchor))
-
-        for sku, pos in zip(cluster_skus, available):
-            sku_to_position[sku] = pos
-            used_positions.add(pos)
-
-    return sku_to_position
+    return hijo
 
 
-def make_fitness_function(
-    products: pd.DataFrame,
-    order_groups: list[list[str]],
-    n_clusters: int,
-    all_positions: list[tuple[int, int]],
-):
+def mutar(asignacion: dict, skus: list[str], rng: np.random.Generator, tasa: float = 0.05) -> dict:
+    """Intercambia la posicion de pares de productos elegidos al azar."""
+    asignacion = asignacion.copy()
+    n_mutaciones = max(1, int(len(skus) * tasa))
+    for _ in range(n_mutaciones):
+        a, b = rng.choice(skus, size=2, replace=False)
+        asignacion[a], asignacion[b] = asignacion[b], asignacion[a]
+    return asignacion
+
+
+def reparar_restricciones(
+    asignacion: dict,
+    peso_por_sku: dict,
+    capacidades_por_nivel: dict[int, float] | None,
+    rng: np.random.Generator,
+    max_intentos: int = 3,
+) -> dict:
     """
-    Construye la funcion de fitness que evalua PyGAD. Cada solucion es un
-    vector de longitud n_clusters*2, representando la posicion ancla de
-    cada cluster. PyGAD maximiza el fitness, por lo que se retorna el
-    inverso de la distancia total.
+    Corrige violaciones de capacidad estructural que pueden introducirse
+    durante el cruce o la mutacion (operaciones que intercambian
+    posiciones sin verificar si el producto resultante cumple la
+    capacidad de su nuevo nivel).
     """
-    def fitness_func(ga_instance, solution, solution_idx):
-        cluster_positions = solution.reshape(n_clusters, 2)
-        cluster_anchor_positions = {i: tuple(cluster_positions[i]) for i in range(n_clusters)}
+    asignacion = asignacion.copy()
 
-        sku_to_position = assign_individual_positions(products, cluster_anchor_positions, all_positions)
-        distance = total_distance_for_positions(order_groups, sku_to_position)
+    for _ in range(max_intentos):
+        skus = list(asignacion.keys())
+        violaciones = []
+        for sku in skus:
+            peso = peso_por_sku.get(sku)
+            if peso is None:
+                continue
+            nivel = asignacion[sku][2]
+            if not producto_cabe_estructuralmente(peso, nivel, capacidades_por_nivel):
+                violaciones.append(sku)
 
-        return 1.0 / (distance + 1e-6)
+        if not violaciones:
+            break
 
-    return fitness_func
+        for sku in violaciones:
+            peso = peso_por_sku[sku]
+            candidato = next(
+                (
+                    otro for otro in skus
+                    if otro != sku
+                    and producto_cabe_estructuralmente(peso, asignacion[otro][2], capacidades_por_nivel)
+                    and producto_cabe_estructuralmente(peso_por_sku.get(otro) or 0, asignacion[sku][2], capacidades_por_nivel)
+                ),
+                None,
+            )
+            if candidato is not None:
+                asignacion[sku], asignacion[candidato] = asignacion[candidato], asignacion[sku]
+
+    return asignacion
 
 
 def run_genetic_algorithm(
     products: pd.DataFrame,
     order_groups: list[list[str]],
-    n_clusters: int,
-    all_positions: list[tuple[int, int]],
-    n_aisles: int,
-    slots_per_aisle: int,
-    num_generations: int = 50,
-    sol_per_pop: int = 20,
-) -> tuple[np.ndarray, list[float]]:
+    all_positions: list[tuple[int, int, int]],
+    capacidades_por_nivel: dict[int, float] | None = None,
+    num_generations: int = 40,
+    poblacion: int = 20,
+    random_state: int = 42,
+) -> tuple[dict[str, tuple[int, int, int]], list[float]]:
     """
-    Ejecuta el Algoritmo Genetico y retorna la mejor solucion encontrada
-    (posiciones ancla por cluster) junto con el historial de fitness por
-    generacion.
+    Ejecuta el Algoritmo Genetico y retorna la mejor asignacion de
+    posiciones encontrada (sku -> posicion), junto con el historial de
+    costo (distancia) del mejor individuo por generacion.
     """
-    fitness_func = make_fitness_function(products, order_groups, n_clusters, all_positions)
+    rng = np.random.default_rng(random_state)
+    skus = products["sku"].tolist()
 
-    gene_space = []
-    for _ in range(n_clusters):
-        gene_space.append({"low": 1, "high": n_aisles})
-        gene_space.append({"low": 1, "high": slots_per_aisle})
+    posiciones_validas = posiciones_validas_por_producto(products, all_positions, capacidades_por_nivel)
 
-    fitness_history = []
+    tiene_peso = "weight_kg" in products.columns
+    peso_por_sku = {
+        row["sku"]: (row["weight_kg"] if tiene_peso and pd.notna(row.get("weight_kg")) else None)
+        for _, row in products.iterrows()
+    }
 
-    def on_generation(ga_instance):
-        fitness_history.append(1.0 / ga_instance.best_solution()[1])
+    poblacion_actual = [
+        asignacion_inicial_aleatoria(products, all_positions, posiciones_validas, rng)
+        for _ in range(poblacion)
+    ]
 
-    ga_instance = pygad.GA(
-        num_generations=num_generations,
-        num_parents_mating=6,
-        fitness_func=fitness_func,
-        sol_per_pop=sol_per_pop,
-        num_genes=n_clusters * 2,
-        gene_space=gene_space,
-        gene_type=int,
-        parent_selection_type="sss",
-        crossover_type="single_point",
-        mutation_type="random",
-        mutation_percent_genes=20,
-        random_seed=42,
-        on_generation=on_generation,
-    )
+    historial_mejor_costo = []
 
-    ga_instance.run()
+    for generacion in range(num_generations):
+        costos = [evaluar_ruta_real(order_groups, individuo) for individuo in poblacion_actual]
 
-    best_solution, best_fitness, _ = ga_instance.best_solution()
-    best_positions = best_solution.reshape(n_clusters, 2)
+        orden = np.argsort(costos)
+        poblacion_actual = [poblacion_actual[i] for i in orden]
+        costos = [costos[i] for i in orden]
 
-    return best_positions, fitness_history
+        historial_mejor_costo.append(costos[0])
+
+        n_elite = max(2, poblacion // 5)
+        nueva_poblacion = poblacion_actual[:n_elite]
+
+        while len(nueva_poblacion) < poblacion:
+            padre1, padre2 = poblacion_actual[rng.integers(0, poblacion // 2)], poblacion_actual[rng.integers(0, poblacion // 2)]
+            hijo = cruzar(padre1, padre2, skus, all_positions, rng)
+            hijo = mutar(hijo, skus, rng)
+            hijo = reparar_restricciones(hijo, peso_por_sku, capacidades_por_nivel, rng)
+            nueva_poblacion.append(hijo)
+
+        poblacion_actual = nueva_poblacion
+
+    costos_finales = [evaluar_ruta_real(order_groups, individuo) for individuo in poblacion_actual]
+    mejor_idx = int(np.argmin(costos_finales))
+
+    return poblacion_actual[mejor_idx], historial_mejor_costo
+
+
+def random_baseline_distance(
+    products: pd.DataFrame,
+    order_groups: list[list[str]],
+    all_positions: list[tuple[int, int, int]],
+    random_state: int = 42,
+) -> float:
+    """Distancia total con asignacion aleatoria, sobre el mismo almacen que las demas comparaciones."""
+    rng = np.random.default_rng(random_state)
+    posiciones = list(all_positions)
+    rng.shuffle(posiciones)
+    sku_to_position = dict(zip(products["sku"].tolist(), posiciones))
+    return evaluar_ruta_real(order_groups, sku_to_position)
+
+
+def popularity_baseline_distance(
+    products: pd.DataFrame,
+    orders: pd.DataFrame,
+    order_groups: list[list[str]],
+    all_positions: list[tuple[int, int, int]],
+) -> float:
+    """
+    Distancia total con heuristica de popularidad (analisis ABC): los
+    productos mas pedidos se ubican mas cerca de la puerta de despacho.
+    """
+    frecuencia = orders["sku"].value_counts()
+    skus_por_popularidad = frecuencia.index.tolist()
+
+    posiciones_ordenadas = sorted(all_positions, key=lambda p: manhattan_distance_3d(p, PUERTA_DESPACHO))
+
+    sku_to_position = {}
+    for sku, pos in zip(skus_por_popularidad, posiciones_ordenadas):
+        sku_to_position[sku] = pos
+    for sku in products["sku"]:
+        if sku not in sku_to_position:
+            sku_to_position[sku] = posiciones_ordenadas[-1]
+
+    return evaluar_ruta_real(order_groups, sku_to_position)

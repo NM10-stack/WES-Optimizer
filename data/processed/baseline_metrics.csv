@@ -1,2 +1,2 @@
-silhouette_score,n_clusters,n_aisles,slots_per_aisle,distancia_inicial,distancia_heuristica_popularidad,distancia_optimizada,mejora_porcentual,mejora_vs_heuristica_pct
-0.0051314369350097125,4,63,63,21397615.0,14023238.0,15168615.0,29.110720984558323,-8.167707058811951
+silhouette_score,n_clusters,n_aisles,slots_per_aisle,niveles_altura,distancia_inicial_aleatoria,distancia_heuristica_popularidad,distancia_optimizada,mejora_vs_aleatorio_pct,mejora_vs_heuristica_pct
+0.0051314369350097125,4,32,32,4,4925704.0,3633820.0,4695996.0,4.663455213711583,-29.230286585466537
