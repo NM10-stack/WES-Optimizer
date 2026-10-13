@@ -1,327 +1,1554 @@
 """
 Modulo de optimizacion de posiciones fisicas mediante Algoritmo Genetico.
 
-Cada producto recibe una posicion tridimensional individual y distinta
-(pasillo, posicion en el pasillo, nivel de altura), respetando la
-capacidad estructural de cada nivel de estanteria (restricciones_
-ergonomicas.py). El cromosoma es una permutacion de posiciones
-asignadas a productos, y el fitness se calcula simulando la ruta real
-de recoleccion (el operario siempre se dirige al producto no recogido
-mas cercano), partiendo y regresando a la puerta de despacho.
+Cada producto recibe una posicion tridimensional individual y distinta:
+(pasillo, posicion en el pasillo, nivel de altura).
 
-El tamano del almacen (pasillos x posiciones por pasillo x niveles) se
-calcula dinamicamente segun la cantidad de productos a ubicar.
+El algoritmo considera:
+
+- Distancia Manhattan 3D.
+- Penalizacion por desplazamiento vertical.
+- Restricciones estructurales de estanteria.
+- Baseline aleatorio.
+- Baseline por popularidad.
+- Algoritmo Genetico puro.
+- Inicializacion guiada por clusters obtenidos mediante K-Medoids.
+
+El fitness simula la ruta de picking de cada pedido mediante una
+heuristica de vecino mas cercano, partiendo y regresando a la puerta
+de despacho.
 """
+
+from __future__ import annotations
 
 import numpy as np
 import pandas as pd
 
-from restricciones_ergonomicas import producto_cabe_estructuralmente
+from .restricciones_ergonomicas import (
+    producto_cabe_estructuralmente,
+)
+
+
+# ============================================================
+# PARAMETROS GENERALES
+# ============================================================
 
 NIVELES_ALTURA = 4
+
 FACTOR_COSTO_ALTURA = 2.0
+
 PUERTA_DESPACHO = (0, 0, 0)
 
 
-def compute_warehouse_dimensions(n_products: int, niveles: int = NIVELES_ALTURA, min_lado: int = 10) -> tuple[int, int, int]:
+# ============================================================
+# DIMENSIONES DEL ALMACEN
+# ============================================================
+
+def compute_warehouse_dimensions(
+    n_products: int,
+    niveles: int = NIVELES_ALTURA,
+    min_lado: int = 10,
+) -> tuple[int, int, int]:
     """
-    Calcula un layout de almacen de forma razonablemente cuadrada en el
-    plano (pasillo x posicion), dado un numero fijo de niveles de
-    altura, con capacidad suficiente para todos los productos.
+    Calcula automaticamente las dimensiones del almacen.
+
+    Se genera un layout aproximadamente cuadrado en el plano:
+
+        pasillos x slots x niveles
+
+    asegurando capacidad suficiente para todos los productos.
     """
-    posiciones_por_nivel_necesarias = int(np.ceil(n_products / niveles))
-    lado = max(int(np.ceil(np.sqrt(posiciones_por_nivel_necesarias))), min_lado)
-    return lado, lado, niveles
+
+    if n_products <= 0:
+        raise ValueError(
+            "n_products debe ser mayor que cero."
+        )
+
+    posiciones_por_nivel_necesarias = int(
+        np.ceil(
+            n_products / niveles
+        )
+    )
+
+    lado = max(
+        int(
+            np.ceil(
+                np.sqrt(
+                    posiciones_por_nivel_necesarias
+                )
+            )
+        ),
+        min_lado,
+    )
+
+    return (
+        lado,
+        lado,
+        niveles,
+    )
 
 
-def build_all_positions(n_aisles: int, slots_per_aisle: int, niveles: int) -> list[tuple[int, int, int]]:
-    """Genera todas las posiciones (pasillo, slot, nivel) posibles del almacen."""
+def build_all_positions(
+    n_aisles: int,
+    slots_per_aisle: int,
+    niveles: int,
+) -> list[tuple[int, int, int]]:
+    """
+    Genera todas las posiciones posibles del almacen.
+
+    Cada posicion tiene la forma:
+
+        (pasillo, slot, nivel)
+    """
+
     return [
-        (a, s, n)
-        for a in range(1, n_aisles + 1)
-        for s in range(1, slots_per_aisle + 1)
-        for n in range(niveles)
+        (aisle, slot, nivel)
+        for aisle in range(
+            1,
+            n_aisles + 1,
+        )
+        for slot in range(
+            1,
+            slots_per_aisle + 1,
+        )
+        for nivel in range(
+            niveles
+        )
     ]
 
 
-def manhattan_distance_3d(pos_a: tuple[int, int, int], pos_b: tuple[int, int, int]) -> float:
+# ============================================================
+# DISTANCIA
+# ============================================================
+
+def manhattan_distance_3d(
+    pos_a: tuple[int, int, int],
+    pos_b: tuple[int, int, int],
+) -> float:
     """
-    Distancia Manhattan en 3D, penalizando el desplazamiento vertical
-    (cambio de nivel) con un factor mayor que el desplazamiento
-    horizontal, ya que subir/bajar de nivel toma mas tiempo y esfuerzo
-    que desplazarse en el plano del almacen.
+    Distancia Manhattan tridimensional.
+
+    El desplazamiento vertical recibe una penalizacion adicional
+    debido al mayor costo asociado al cambio de nivel.
     """
-    dist_horizontal = abs(pos_a[0] - pos_b[0]) + abs(pos_a[1] - pos_b[1])
-    dist_vertical = abs(pos_a[2] - pos_b[2]) * FACTOR_COSTO_ALTURA
-    return dist_horizontal + dist_vertical
+
+    dist_horizontal = (
+        abs(
+            pos_a[0] - pos_b[0]
+        )
+        +
+        abs(
+            pos_a[1] - pos_b[1]
+        )
+    )
+
+    dist_vertical = (
+        abs(
+            pos_a[2] - pos_b[2]
+        )
+        * FACTOR_COSTO_ALTURA
+    )
+
+    return (
+        dist_horizontal
+        +
+        dist_vertical
+    )
 
 
-def build_order_groups(orders: pd.DataFrame) -> list[list[str]]:
-    """Agrupa el historial de pedidos en listas de SKUs por order_id."""
-    return orders.groupby("order_id")["sku"].apply(list).tolist()
+# ============================================================
+# PEDIDOS
+# ============================================================
+
+def build_order_groups(
+    orders: pd.DataFrame,
+) -> list[list[str]]:
+    """
+    Agrupa los SKU del historial segun order_id.
+    """
+
+    columnas_requeridas = {
+        "order_id",
+        "sku",
+    }
+
+    faltantes = (
+        columnas_requeridas
+        -
+        set(orders.columns)
+    )
+
+    if faltantes:
+        raise ValueError(
+            "Faltan columnas en orders: "
+            + ", ".join(
+                sorted(faltantes)
+            )
+        )
+
+    return (
+        orders
+        .groupby("order_id")["sku"]
+        .apply(list)
+        .tolist()
+    )
 
 
-def evaluar_ruta_real(order_groups: list[list[str]], sku_to_position: dict[str, tuple[int, int, int]]) -> float:
+# ============================================================
+# FUNCION OBJETIVO / FITNESS
+# ============================================================
+
+def evaluar_ruta_real(
+    order_groups: list[list[str]],
+    sku_to_position: dict[
+        str,
+        tuple[int, int, int]
+    ],
+) -> float:
     """
-    Simula la ruta de recoleccion de cada pedido: el operario parte de
-    la puerta de despacho y, en cada paso, se dirige al producto no
-    recogido mas cercano a su posicion actual, hasta completar el
-    pedido y retornar a la puerta. Esta aproximacion (vecino mas
-    cercano) es mas realista que sumar distancias en un orden arbitrario
-    de aparicion en el historial de pedidos.
+    Simula la ruta de picking de todos los pedidos.
+
+    Para cada pedido:
+
+    1. El operario comienza en la puerta de despacho.
+    2. Se dirige al producto pendiente mas cercano.
+    3. Repite hasta completar el pedido.
+    4. Regresa a la puerta de despacho.
+
+    El costo total corresponde a la suma de las distancias.
     """
+
     costo_total = 0.0
 
     for skus in order_groups:
-        posiciones_pendientes = [sku_to_position[s] for s in skus if s in sku_to_position]
+
+        posiciones_pendientes = [
+            sku_to_position[sku]
+            for sku in skus
+            if sku in sku_to_position
+        ]
+
         if not posiciones_pendientes:
             continue
 
-        posicion_actual = PUERTA_DESPACHO
+        posicion_actual = (
+            PUERTA_DESPACHO
+        )
+
         while posiciones_pendientes:
-            distancias = [manhattan_distance_3d(posicion_actual, p) for p in posiciones_pendientes]
-            idx_mas_cercano = int(np.argmin(distancias))
-            costo_total += distancias[idx_mas_cercano]
-            posicion_actual = posiciones_pendientes.pop(idx_mas_cercano)
 
-        costo_total += manhattan_distance_3d(posicion_actual, PUERTA_DESPACHO)
+            distancias = [
+                manhattan_distance_3d(
+                    posicion_actual,
+                    posicion,
+                )
+                for posicion
+                in posiciones_pendientes
+            ]
 
-    return costo_total
+            idx_mas_cercano = int(
+                np.argmin(
+                    distancias
+                )
+            )
 
+            costo_total += (
+                distancias[
+                    idx_mas_cercano
+                ]
+            )
+
+            posicion_actual = (
+                posiciones_pendientes.pop(
+                    idx_mas_cercano
+                )
+            )
+
+        costo_total += (
+            manhattan_distance_3d(
+                posicion_actual,
+                PUERTA_DESPACHO,
+            )
+        )
+
+    return float(
+        costo_total
+    )
+
+
+# ============================================================
+# POSICIONES VALIDAS
+# ============================================================
 
 def posiciones_validas_por_producto(
     products: pd.DataFrame,
-    all_positions: list[tuple[int, int, int]],
-    capacidades_por_nivel: dict[int, float] | None = None,
-) -> dict[str, list[tuple[int, int, int]]]:
+    all_positions: list[
+        tuple[int, int, int]
+    ],
+    capacidades_por_nivel: (
+        dict[int, float] | None
+    ) = None,
+) -> dict[
+    str,
+    list[
+        tuple[int, int, int]
+    ],
+]:
     """
-    Para cada producto, filtra las posiciones del almacen que respetan
-    la capacidad estructural del nivel. Si el producto no tiene peso
-    declarado, se asume sin restriccion (todas las posiciones validas).
+    Determina las posiciones validas para cada SKU.
+
+    Si existe weight_kg, se verifica la capacidad estructural
+    del nivel.
+
+    Si no existe peso, todas las posiciones se consideran
+    disponibles.
     """
-    tiene_peso = "weight_kg" in products.columns
+
+    if "sku" not in products.columns:
+        raise ValueError(
+            "products debe contener "
+            "la columna 'sku'."
+        )
+
+    tiene_peso = (
+        "weight_kg"
+        in products.columns
+    )
 
     validas = {}
-    for _, row in products.iterrows():
+
+    for _, row in (
+        products.iterrows()
+    ):
+
         sku = row["sku"]
-        peso = row["weight_kg"] if tiene_peso and pd.notna(row.get("weight_kg")) else None
+
+        if (
+            tiene_peso
+            and pd.notna(
+                row.get(
+                    "weight_kg"
+                )
+            )
+        ):
+            peso = float(
+                row["weight_kg"]
+            )
+        else:
+            peso = None
 
         if peso is None:
-            validas[sku] = all_positions
+
+            validas[sku] = list(
+                all_positions
+            )
+
         else:
-            validas[sku] = [
-                p for p in all_positions
-                if producto_cabe_estructuralmente(peso, p[2], capacidades_por_nivel)
-            ] or all_positions
+
+            posiciones = [
+                posicion
+                for posicion
+                in all_positions
+                if producto_cabe_estructuralmente(
+                    peso,
+                    posicion[2],
+                    capacidades_por_nivel,
+                )
+            ]
+
+            # Respaldo para no dejar
+            # un SKU sin ubicaciones.
+            validas[sku] = (
+                posiciones
+                if posiciones
+                else list(
+                    all_positions
+                )
+            )
 
     return validas
 
 
+# ============================================================
+# ASIGNACION INICIAL ALEATORIA
+# ============================================================
+
 def asignacion_inicial_aleatoria(
     products: pd.DataFrame,
-    all_positions: list[tuple[int, int, int]],
-    posiciones_validas: dict[str, list[tuple[int, int, int]]],
+    all_positions: list[
+        tuple[int, int, int]
+    ],
+    posiciones_validas: dict[
+        str,
+        list[
+            tuple[int, int, int]
+        ],
+    ],
     rng: np.random.Generator,
-) -> dict[str, tuple[int, int, int]]:
+) -> dict[
+    str,
+    tuple[int, int, int],
+]:
     """
-    Genera una asignacion aleatoria valida (respetando restricciones de
-    peso) sin repetir posiciones entre productos. Se procesan primero
-    los productos con menos posiciones validas disponibles (mas
-    restringidos), para reducir la probabilidad de quedarse sin
-    posiciones libres al final.
+    Genera una asignacion inicial aleatoria sin repetir posiciones.
+
+    Los SKU con menos posiciones validas se procesan primero.
     """
-    productos_ordenados = sorted(products["sku"].tolist(), key=lambda s: len(posiciones_validas[s]))
+
+    productos_ordenados = sorted(
+        products["sku"].tolist(),
+        key=lambda sku: len(
+            posiciones_validas[
+                sku
+            ]
+        ),
+    )
+
     usadas = set()
+
     asignacion = {}
 
     for sku in productos_ordenados:
-        disponibles = [p for p in posiciones_validas[sku] if p not in usadas]
+
+        disponibles = [
+            posicion
+            for posicion
+            in posiciones_validas[
+                sku
+            ]
+            if posicion
+            not in usadas
+        ]
+
         if not disponibles:
-            disponibles = [p for p in all_positions if p not in usadas]
-        elegida = disponibles[rng.integers(0, len(disponibles))]
-        asignacion[sku] = elegida
-        usadas.add(elegida)
+
+            disponibles = [
+                posicion
+                for posicion
+                in all_positions
+                if posicion
+                not in usadas
+            ]
+
+        if not disponibles:
+            raise ValueError(
+                "No existen suficientes "
+                "posiciones para todos "
+                "los productos."
+            )
+
+        indice = int(
+            rng.integers(
+                0,
+                len(disponibles),
+            )
+        )
+
+        elegida = (
+            disponibles[
+                indice
+            ]
+        )
+
+        asignacion[
+            sku
+        ] = elegida
+
+        usadas.add(
+            elegida
+        )
 
     return asignacion
 
 
-def cruzar(padre1: dict, padre2: dict, skus: list[str], all_positions: list, rng: np.random.Generator) -> dict:
+# ============================================================
+# ASIGNACION GUIADA POR K-MEDOIDS
+# ============================================================
+
+def asignacion_inicial_guiada_clusters(
+    products: pd.DataFrame,
+    all_positions: list[
+        tuple[int, int, int]
+    ],
+    posiciones_validas: dict[
+        str,
+        list[
+            tuple[int, int, int]
+        ],
+    ],
+    rng: np.random.Generator,
+) -> dict[
+    str,
+    tuple[int, int, int],
+]:
     """
-    Cruce de orden: hereda las posiciones de la primera mitad de
-    productos desde el padre1, y completa el resto con las posiciones
-    del padre2 que aun esten libres; si alguna posicion ya fue tomada,
-    se asigna la primera posicion libre disponible.
+    Genera una asignacion inicial guiada por clusters.
+
+    Los SKU pertenecientes al mismo cluster se intentan ubicar
+    fisicamente cerca entre si.
+
+    K-Medoids guia solamente la poblacion inicial.
+
+    Posteriormente el Algoritmo Genetico mantiene libertad para
+    modificar las posiciones segun el fitness.
     """
-    punto_corte = len(skus) // 2
-    hijo = {}
+
+    if (
+        "cluster"
+        not in products.columns
+    ):
+        return (
+            asignacion_inicial_aleatoria(
+                products,
+                all_positions,
+                posiciones_validas,
+                rng,
+            )
+        )
+
+    asignacion = {}
+
     usadas = set()
 
-    for sku in skus[:punto_corte]:
-        hijo[sku] = padre1[sku]
-        usadas.add(padre1[sku])
+    grupos = [
+        grupo["sku"].tolist()
+        for _, grupo
+        in products.groupby(
+            "cluster",
+            dropna=False,
+        )
+    ]
 
-    for sku in skus[punto_corte:]:
-        pos = padre2[sku]
-        if pos not in usadas:
-            hijo[sku] = pos
-            usadas.add(pos)
+    orden_clusters = (
+        rng.permutation(
+            len(grupos)
+        )
+    )
+
+    for idx_cluster in (
+        orden_clusters
+    ):
+
+        skus_cluster = grupos[
+            int(idx_cluster)
+        ]
+
+        skus_cluster = sorted(
+            skus_cluster,
+            key=lambda sku: len(
+                posiciones_validas.get(
+                    sku,
+                    [],
+                )
+            ),
+        )
+
+        posicion_referencia = None
+
+        for sku in skus_cluster:
+
+            candidatos = [
+                posicion
+                for posicion
+                in posiciones_validas.get(
+                    sku,
+                    all_positions,
+                )
+                if posicion
+                not in usadas
+            ]
+
+            if not candidatos:
+
+                candidatos = [
+                    posicion
+                    for posicion
+                    in all_positions
+                    if posicion
+                    not in usadas
+                ]
+
+            if not candidatos:
+                raise ValueError(
+                    "No existen suficientes "
+                    "posiciones disponibles "
+                    "para asignar todos "
+                    "los SKU."
+                )
+
+            if (
+                posicion_referencia
+                is None
+            ):
+
+                indice = int(
+                    rng.integers(
+                        0,
+                        len(candidatos),
+                    )
+                )
+
+                elegida = (
+                    candidatos[
+                        indice
+                    ]
+                )
+
+                posicion_referencia = (
+                    elegida
+                )
+
+            else:
+
+                distancias = [
+                    manhattan_distance_3d(
+                        posicion_referencia,
+                        posicion,
+                    )
+                    for posicion
+                    in candidatos
+                ]
+
+                distancia_minima = (
+                    min(
+                        distancias
+                    )
+                )
+
+                candidatos_cercanos = [
+                    posicion
+                    for posicion, distancia
+                    in zip(
+                        candidatos,
+                        distancias,
+                    )
+                    if (
+                        distancia
+                        ==
+                        distancia_minima
+                    )
+                ]
+
+                indice = int(
+                    rng.integers(
+                        0,
+                        len(
+                            candidatos_cercanos
+                        ),
+                    )
+                )
+
+                elegida = (
+                    candidatos_cercanos[
+                        indice
+                    ]
+                )
+
+            asignacion[
+                sku
+            ] = elegida
+
+            usadas.add(
+                elegida
+            )
+
+    return asignacion
+
+
+# ============================================================
+# CRUCE
+# ============================================================
+
+def cruzar(
+    padre1: dict[
+        str,
+        tuple[int, int, int],
+    ],
+    padre2: dict[
+        str,
+        tuple[int, int, int],
+    ],
+    skus: list[str],
+    all_positions: list[
+        tuple[int, int, int]
+    ],
+    rng: np.random.Generator,
+) -> dict[
+    str,
+    tuple[int, int, int],
+]:
+    """
+    Cruce entre dos individuos.
+
+    La primera mitad de los SKU se hereda del padre 1.
+
+    La segunda mitad intenta heredar posiciones del padre 2.
+
+    Si una posicion ya esta ocupada se selecciona una posicion
+    libre.
+    """
+
+    punto_corte = (
+        len(skus) // 2
+    )
+
+    hijo = {}
+
+    usadas = set()
+
+    for sku in (
+        skus[:punto_corte]
+    ):
+
+        posicion = (
+            padre1[sku]
+        )
+
+        hijo[sku] = posicion
+
+        usadas.add(
+            posicion
+        )
+
+    for sku in (
+        skus[punto_corte:]
+    ):
+
+        posicion = (
+            padre2[sku]
+        )
+
+        if (
+            posicion
+            not in usadas
+        ):
+
+            hijo[
+                sku
+            ] = posicion
+
+            usadas.add(
+                posicion
+            )
+
         else:
-            libre = next(p for p in all_positions if p not in usadas)
-            hijo[sku] = libre
-            usadas.add(libre)
+
+            disponibles = [
+                posicion_libre
+                for posicion_libre
+                in all_positions
+                if posicion_libre
+                not in usadas
+            ]
+
+            if not disponibles:
+                raise ValueError(
+                    "No quedan posiciones "
+                    "libres durante el cruce."
+                )
+
+            indice = int(
+                rng.integers(
+                    0,
+                    len(disponibles),
+                )
+            )
+
+            libre = (
+                disponibles[
+                    indice
+                ]
+            )
+
+            hijo[
+                sku
+            ] = libre
+
+            usadas.add(
+                libre
+            )
 
     return hijo
 
 
-def mutar(asignacion: dict, skus: list[str], rng: np.random.Generator, tasa: float = 0.05) -> dict:
-    """Intercambia la posicion de pares de productos elegidos al azar."""
-    asignacion = asignacion.copy()
-    n_mutaciones = max(1, int(len(skus) * tasa))
-    for _ in range(n_mutaciones):
-        a, b = rng.choice(skus, size=2, replace=False)
-        asignacion[a], asignacion[b] = asignacion[b], asignacion[a]
+# ============================================================
+# MUTACION
+# ============================================================
+
+def mutar(
+    asignacion: dict[
+        str,
+        tuple[int, int, int],
+    ],
+    skus: list[str],
+    rng: np.random.Generator,
+    tasa: float = 0.05,
+) -> dict[
+    str,
+    tuple[int, int, int],
+]:
+    """
+    Intercambia posiciones entre pares de productos.
+    """
+
+    asignacion = (
+        asignacion.copy()
+    )
+
+    if len(skus) < 2:
+        return asignacion
+
+    n_mutaciones = max(
+        1,
+        int(
+            len(skus)
+            * tasa
+        ),
+    )
+
+    for _ in range(
+        n_mutaciones
+    ):
+
+        seleccionados = (
+            rng.choice(
+                skus,
+                size=2,
+                replace=False,
+            )
+        )
+
+        sku_a = (
+            seleccionados[0]
+        )
+
+        sku_b = (
+            seleccionados[1]
+        )
+
+        (
+            asignacion[sku_a],
+            asignacion[sku_b],
+        ) = (
+            asignacion[sku_b],
+            asignacion[sku_a],
+        )
+
     return asignacion
 
 
+# ============================================================
+# REPARACION DE RESTRICCIONES
+# ============================================================
+
 def reparar_restricciones(
-    asignacion: dict,
+    asignacion: dict[
+        str,
+        tuple[int, int, int],
+    ],
     peso_por_sku: dict,
-    capacidades_por_nivel: dict[int, float] | None,
+    capacidades_por_nivel: (
+        dict[int, float] | None
+    ),
     rng: np.random.Generator,
     max_intentos: int = 3,
-) -> dict:
+) -> dict[
+    str,
+    tuple[int, int, int],
+]:
     """
-    Corrige violaciones de capacidad estructural que pueden introducirse
-    durante el cruce o la mutacion (operaciones que intercambian
-    posiciones sin verificar si el producto resultante cumple la
-    capacidad de su nuevo nivel).
+    Corrige violaciones de capacidad estructural introducidas
+    durante el cruce o la mutacion.
     """
-    asignacion = asignacion.copy()
 
-    for _ in range(max_intentos):
-        skus = list(asignacion.keys())
+    asignacion = (
+        asignacion.copy()
+    )
+
+    for _ in range(
+        max_intentos
+    ):
+
+        skus = list(
+            asignacion.keys()
+        )
+
         violaciones = []
+
         for sku in skus:
-            peso = peso_por_sku.get(sku)
+
+            peso = (
+                peso_por_sku.get(
+                    sku
+                )
+            )
+
             if peso is None:
                 continue
-            nivel = asignacion[sku][2]
-            if not producto_cabe_estructuralmente(peso, nivel, capacidades_por_nivel):
-                violaciones.append(sku)
+
+            nivel = (
+                asignacion[
+                    sku
+                ][2]
+            )
+
+            if not (
+                producto_cabe_estructuralmente(
+                    peso,
+                    nivel,
+                    capacidades_por_nivel,
+                )
+            ):
+                violaciones.append(
+                    sku
+                )
 
         if not violaciones:
             break
 
         for sku in violaciones:
-            peso = peso_por_sku[sku]
-            candidato = next(
-                (
-                    otro for otro in skus
-                    if otro != sku
-                    and producto_cabe_estructuralmente(peso, asignacion[otro][2], capacidades_por_nivel)
-                    and producto_cabe_estructuralmente(peso_por_sku.get(otro) or 0, asignacion[sku][2], capacidades_por_nivel)
-                ),
-                None,
+
+            peso = (
+                peso_por_sku[
+                    sku
+                ]
             )
-            if candidato is not None:
-                asignacion[sku], asignacion[candidato] = asignacion[candidato], asignacion[sku]
+
+            candidatos = []
+
+            for otro in skus:
+
+                if otro == sku:
+                    continue
+
+                peso_otro = (
+                    peso_por_sku.get(
+                        otro
+                    )
+                )
+
+                if peso_otro is None:
+                    peso_otro = 0.0
+
+                nivel_otro = (
+                    asignacion[
+                        otro
+                    ][2]
+                )
+
+                nivel_actual = (
+                    asignacion[
+                        sku
+                    ][2]
+                )
+
+                cabe_sku = (
+                    producto_cabe_estructuralmente(
+                        peso,
+                        nivel_otro,
+                        capacidades_por_nivel,
+                    )
+                )
+
+                cabe_otro = (
+                    producto_cabe_estructuralmente(
+                        peso_otro,
+                        nivel_actual,
+                        capacidades_por_nivel,
+                    )
+                )
+
+                if (
+                    cabe_sku
+                    and cabe_otro
+                ):
+                    candidatos.append(
+                        otro
+                    )
+
+            if candidatos:
+
+                candidato = (
+                    candidatos[
+                        int(
+                            rng.integers(
+                                0,
+                                len(
+                                    candidatos
+                                ),
+                            )
+                        )
+                    ]
+                )
+
+                (
+                    asignacion[sku],
+                    asignacion[candidato],
+                ) = (
+                    asignacion[candidato],
+                    asignacion[sku],
+                )
 
     return asignacion
 
 
+# ============================================================
+# ALGORITMO GENETICO
+# ============================================================
+
 def run_genetic_algorithm(
     products: pd.DataFrame,
-    order_groups: list[list[str]],
-    all_positions: list[tuple[int, int, int]],
-    capacidades_por_nivel: dict[int, float] | None = None,
+    order_groups: list[
+        list[str]
+    ],
+    all_positions: list[
+        tuple[int, int, int]
+    ],
+    capacidades_por_nivel: (
+        dict[int, float] | None
+    ) = None,
     num_generations: int = 40,
     poblacion: int = 20,
     random_state: int = 42,
-) -> tuple[dict[str, tuple[int, int, int]], list[float]]:
+    proporcion_guiada: float = 0.5,
+    verbose: bool = False,
+    nombre: str = "GA",
+) -> tuple[
+    dict[
+        str,
+        tuple[int, int, int],
+    ],
+    list[float],
+]:
     """
-    Ejecuta el Algoritmo Genetico y retorna la mejor asignacion de
-    posiciones encontrada (sku -> posicion), junto con el historial de
-    costo (distancia) del mejor individuo por generacion.
+    Ejecuta el Algoritmo Genetico.
+
+    proporcion_guiada:
+
+        0.0 = GA puro.
+        0.5 = mitad K-Medoids y mitad aleatorio.
+        1.0 = poblacion inicial completamente guiada.
+
+    verbose:
+
+        True muestra el avance de cada generacion.
     """
-    rng = np.random.default_rng(random_state)
-    skus = products["sku"].tolist()
 
-    posiciones_validas = posiciones_validas_por_producto(products, all_positions, capacidades_por_nivel)
+    if not (
+        0.0
+        <= proporcion_guiada
+        <= 1.0
+    ):
+        raise ValueError(
+            "proporcion_guiada debe "
+            "estar entre 0.0 y 1.0."
+        )
 
-    tiene_peso = "weight_kg" in products.columns
+    if poblacion < 4:
+        raise ValueError(
+            "La poblacion debe ser "
+            "al menos 4."
+        )
+
+    if num_generations < 1:
+        raise ValueError(
+            "num_generations debe "
+            "ser al menos 1."
+        )
+
+    rng = (
+        np.random.default_rng(
+            random_state
+        )
+    )
+
+    skus = (
+        products[
+            "sku"
+        ].tolist()
+    )
+
+    posiciones_validas = (
+        posiciones_validas_por_producto(
+            products,
+            all_positions,
+            capacidades_por_nivel,
+        )
+    )
+
+    tiene_peso = (
+        "weight_kg"
+        in products.columns
+    )
+
     peso_por_sku = {
-        row["sku"]: (row["weight_kg"] if tiene_peso and pd.notna(row.get("weight_kg")) else None)
-        for _, row in products.iterrows()
+        row["sku"]: (
+            float(
+                row["weight_kg"]
+            )
+            if (
+                tiene_peso
+                and pd.notna(
+                    row.get(
+                        "weight_kg"
+                    )
+                )
+            )
+            else None
+        )
+        for _, row
+        in products.iterrows()
     }
 
-    poblacion_actual = [
-        asignacion_inicial_aleatoria(products, all_positions, posiciones_validas, rng)
-        for _ in range(poblacion)
-    ]
+    # --------------------------------------------------------
+    # POBLACION INICIAL
+    # --------------------------------------------------------
+
+    n_guiados = int(
+        poblacion
+        * proporcion_guiada
+    )
+
+    n_aleatorios = (
+        poblacion
+        -
+        n_guiados
+    )
+
+    poblacion_actual = []
+
+    if verbose:
+
+        print()
+        print(
+            "======================================"
+        )
+        print(
+            f"INICIANDO {nombre}"
+        )
+        print(
+            "======================================"
+        )
+
+        print(
+            f"SKU: {len(skus)}"
+        )
+
+        print(
+            f"Pedidos: "
+            f"{len(order_groups)}"
+        )
+
+        print(
+            f"Poblacion: "
+            f"{poblacion}"
+        )
+
+        print(
+            f"Generaciones: "
+            f"{num_generations}"
+        )
+
+        print(
+            f"Guiados K-Medoids: "
+            f"{n_guiados}"
+        )
+
+        print(
+            f"Aleatorios: "
+            f"{n_aleatorios}"
+        )
+
+        print()
+
+    for _ in range(
+        n_guiados
+    ):
+
+        individuo = (
+            asignacion_inicial_guiada_clusters(
+                products,
+                all_positions,
+                posiciones_validas,
+                rng,
+            )
+        )
+
+        poblacion_actual.append(
+            individuo
+        )
+
+    for _ in range(
+        n_aleatorios
+    ):
+
+        individuo = (
+            asignacion_inicial_aleatoria(
+                products,
+                all_positions,
+                posiciones_validas,
+                rng,
+            )
+        )
+
+        poblacion_actual.append(
+            individuo
+        )
 
     historial_mejor_costo = []
 
-    for generacion in range(num_generations):
-        costos = [evaluar_ruta_real(order_groups, individuo) for individuo in poblacion_actual]
+    # --------------------------------------------------------
+    # EVOLUCION
+    # --------------------------------------------------------
 
-        orden = np.argsort(costos)
-        poblacion_actual = [poblacion_actual[i] for i in orden]
-        costos = [costos[i] for i in orden]
+    for generacion in range(
+        num_generations
+    ):
 
-        historial_mejor_costo.append(costos[0])
+        costos = [
+            evaluar_ruta_real(
+                order_groups,
+                individuo,
+            )
+            for individuo
+            in poblacion_actual
+        ]
 
-        n_elite = max(2, poblacion // 5)
-        nueva_poblacion = poblacion_actual[:n_elite]
+        orden = (
+            np.argsort(
+                costos
+            )
+        )
 
-        while len(nueva_poblacion) < poblacion:
-            padre1, padre2 = poblacion_actual[rng.integers(0, poblacion // 2)], poblacion_actual[rng.integers(0, poblacion // 2)]
-            hijo = cruzar(padre1, padre2, skus, all_positions, rng)
-            hijo = mutar(hijo, skus, rng)
-            hijo = reparar_restricciones(hijo, peso_por_sku, capacidades_por_nivel, rng)
-            nueva_poblacion.append(hijo)
+        poblacion_actual = [
+            poblacion_actual[
+                indice
+            ]
+            for indice
+            in orden
+        ]
 
-        poblacion_actual = nueva_poblacion
+        costos = [
+            costos[
+                indice
+            ]
+            for indice
+            in orden
+        ]
 
-    costos_finales = [evaluar_ruta_real(order_groups, individuo) for individuo in poblacion_actual]
-    mejor_idx = int(np.argmin(costos_finales))
+        mejor_costo = float(
+            costos[0]
+        )
 
-    return poblacion_actual[mejor_idx], historial_mejor_costo
+        historial_mejor_costo.append(
+            mejor_costo
+        )
 
+        if verbose:
+
+            print(
+                f"[{nombre}] "
+                f"Generacion "
+                f"{generacion + 1}/"
+                f"{num_generations} "
+                f"| Mejor distancia: "
+                f"{mejor_costo:.2f}"
+            )
+
+        n_elite = max(
+            2,
+            poblacion // 5,
+        )
+
+        n_elite = min(
+            n_elite,
+            poblacion,
+        )
+
+        nueva_poblacion = (
+            poblacion_actual[
+                :n_elite
+            ]
+        )
+
+        limite_padres = max(
+            2,
+            poblacion // 2,
+        )
+
+        limite_padres = min(
+            limite_padres,
+            len(
+                poblacion_actual
+            ),
+        )
+
+        while (
+            len(
+                nueva_poblacion
+            )
+            <
+            poblacion
+        ):
+
+            padre1 = (
+                poblacion_actual[
+                    int(
+                        rng.integers(
+                            0,
+                            limite_padres,
+                        )
+                    )
+                ]
+            )
+
+            padre2 = (
+                poblacion_actual[
+                    int(
+                        rng.integers(
+                            0,
+                            limite_padres,
+                        )
+                    )
+                ]
+            )
+
+            hijo = cruzar(
+                padre1,
+                padre2,
+                skus,
+                all_positions,
+                rng,
+            )
+
+            hijo = mutar(
+                hijo,
+                skus,
+                rng,
+            )
+
+            hijo = (
+                reparar_restricciones(
+                    hijo,
+                    peso_por_sku,
+                    capacidades_por_nivel,
+                    rng,
+                )
+            )
+
+            nueva_poblacion.append(
+                hijo
+            )
+
+        poblacion_actual = (
+            nueva_poblacion
+        )
+
+    # --------------------------------------------------------
+    # EVALUACION FINAL
+    # --------------------------------------------------------
+
+    costos_finales = [
+        evaluar_ruta_real(
+            order_groups,
+            individuo,
+        )
+        for individuo
+        in poblacion_actual
+    ]
+
+    mejor_idx = int(
+        np.argmin(
+            costos_finales
+        )
+    )
+
+    mejor_asignacion = (
+        poblacion_actual[
+            mejor_idx
+        ]
+    )
+
+    mejor_costo_final = float(
+        costos_finales[
+            mejor_idx
+        ]
+    )
+
+    if verbose:
+
+        print()
+
+        print(
+            f"[{nombre}] "
+            f"FINALIZADO"
+        )
+
+        print(
+            f"[{nombre}] "
+            f"Mejor distancia final: "
+            f"{mejor_costo_final:.2f}"
+        )
+
+        print()
+
+    return (
+        mejor_asignacion,
+        historial_mejor_costo,
+    )
+
+
+# ============================================================
+# BASELINE ALEATORIO
+# ============================================================
 
 def random_baseline_distance(
     products: pd.DataFrame,
-    order_groups: list[list[str]],
-    all_positions: list[tuple[int, int, int]],
+    order_groups: list[
+        list[str]
+    ],
+    all_positions: list[
+        tuple[int, int, int]
+    ],
     random_state: int = 42,
 ) -> float:
-    """Distancia total con asignacion aleatoria, sobre el mismo almacen que las demas comparaciones."""
-    rng = np.random.default_rng(random_state)
-    posiciones = list(all_positions)
-    rng.shuffle(posiciones)
-    sku_to_position = dict(zip(products["sku"].tolist(), posiciones))
-    return evaluar_ruta_real(order_groups, sku_to_position)
+    """
+    Calcula la distancia total de una asignacion aleatoria.
+    """
 
+    rng = (
+        np.random.default_rng(
+            random_state
+        )
+    )
+
+    posiciones = list(
+        all_positions
+    )
+
+    rng.shuffle(
+        posiciones
+    )
+
+    skus = (
+        products[
+            "sku"
+        ].tolist()
+    )
+
+    if (
+        len(posiciones)
+        <
+        len(skus)
+    ):
+        raise ValueError(
+            "El almacen no tiene "
+            "suficientes posiciones."
+        )
+
+    sku_to_position = dict(
+        zip(
+            skus,
+            posiciones[
+                :len(skus)
+            ],
+        )
+    )
+
+    return evaluar_ruta_real(
+        order_groups,
+        sku_to_position,
+    )
+
+
+# ============================================================
+# BASELINE POPULARIDAD
+# ============================================================
 
 def popularity_baseline_distance(
     products: pd.DataFrame,
     orders: pd.DataFrame,
-    order_groups: list[list[str]],
-    all_positions: list[tuple[int, int, int]],
+    order_groups: list[
+        list[str]
+    ],
+    all_positions: list[
+        tuple[int, int, int]
+    ],
 ) -> float:
     """
-    Distancia total con heuristica de popularidad (analisis ABC): los
-    productos mas pedidos se ubican mas cerca de la puerta de despacho.
+    Heuristica ABC / popularidad.
+
+    Los SKU mas frecuentes se asignan primero a las posiciones
+    mas cercanas a la puerta de despacho.
     """
-    frecuencia = orders["sku"].value_counts()
-    skus_por_popularidad = frecuencia.index.tolist()
 
-    posiciones_ordenadas = sorted(all_positions, key=lambda p: manhattan_distance_3d(p, PUERTA_DESPACHO))
+    frecuencia = (
+        orders[
+            "sku"
+        ].value_counts()
+    )
 
-    sku_to_position = {}
-    for sku, pos in zip(skus_por_popularidad, posiciones_ordenadas):
-        sku_to_position[sku] = pos
-    for sku in products["sku"]:
-        if sku not in sku_to_position:
-            sku_to_position[sku] = posiciones_ordenadas[-1]
+    skus_productos = (
+        products[
+            "sku"
+        ].tolist()
+    )
 
-    return evaluar_ruta_real(order_groups, sku_to_position)
+    skus_por_popularidad = [
+        sku
+        for sku
+        in frecuencia.index.tolist()
+        if sku
+        in set(
+            skus_productos
+        )
+    ]
+
+    # Agregar SKU que no aparezcan
+    # en el historial.
+    restantes = [
+        sku
+        for sku
+        in skus_productos
+        if sku
+        not in set(
+            skus_por_popularidad
+        )
+    ]
+
+    skus_ordenados = (
+        skus_por_popularidad
+        +
+        restantes
+    )
+
+    posiciones_ordenadas = sorted(
+        all_positions,
+        key=lambda posicion:
+            manhattan_distance_3d(
+                posicion,
+                PUERTA_DESPACHO,
+            ),
+    )
+
+    if (
+        len(posiciones_ordenadas)
+        <
+        len(skus_ordenados)
+    ):
+        raise ValueError(
+            "El almacen no tiene "
+            "suficientes posiciones."
+        )
+
+    sku_to_position = dict(
+        zip(
+            skus_ordenados,
+            posiciones_ordenadas,
+        )
+    )
+
+    return evaluar_ruta_real(
+        order_groups,
+        sku_to_position,
+    )

@@ -27,3 +27,4 @@ seaborn>=0.13
 # Utilidades
 python-dotenv>=1.0
 pytest>=8.0
+kmedoids==0.5.5

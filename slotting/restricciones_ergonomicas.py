@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 Restricciones de peso para asignacion de productos en estanterias.
 
